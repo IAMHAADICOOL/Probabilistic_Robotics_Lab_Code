@@ -1,39 +1,72 @@
-# PR_LAB4 — Feature EKF Map-Based Localization (Displacement Motion Model, Cartesian Features)
+# PR_LAB4 — Feature EKF Map-Based Localization (Displacement Motion Model, Polar Observations)
 
 **Course:** Probabilistic Robotics — IFROS / MIRS Masters, Universitat de Girona  
-**Topic:** Feature EKF Map-Based Localization (FEKFMBL) using a 2D Cartesian feature map, Cartesian point observations, and an input displacement motion model
+**Topic:** Feature EKF Map-Based Localization (FEKFMBL) with two variations: polar-stored features observed in polar, and Cartesian-stored features observed in polar
 
 ---
 
 ## Overview
 
-This lab is the first full implementation of **map-based localization**: the robot knows a pre-built map of point landmarks (Cartesian `[x, y]` features) and uses EKF to correct its pose estimate whenever it observes those landmarks.
+This lab extends the FEKFMBL framework from the Cartesian observation lab to work with **polar coordinate observations** (`[ρ, θ]`). The displacement motion model and ICNN data association pipeline are identical — the only difference is how features are represented in the sensor, in the map, and in the observation model.
 
-The three pillars of this lab:
+Two variations are implemented, each as a standalone entry point:
 
-1. **Motion model — Input Displacement:** Same as the displacement EKF from LAB3. Encoder readings are converted to a body-frame displacement `u_k = [Δx, Δy, Δψ]^T` which drives the EKF prediction. The 3-DOF state remains `x_k = [x, y, ψ]^T`.
+### Variation 1 — Polar Features, Polar Observations (`MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM.py`)
 
-2. **Feature observations — Cartesian points:** The robot sensor returns the `[x, y]` position of nearby landmarks in the robot body frame. Both storage (in the map) and observation are in Cartesian coordinates — no coordinate conversion needed.
+The map itself stores features in **polar coordinates** `[ρ, θ]`. The sensor also returns observations in polar coordinates. Since storage and observation share the same representation, `s2o` and `o2s` are both the identity — no coordinate conversion occurs in the observation pipeline.
 
-3. **Data association — ICNN:** The Individual Compatibility Nearest Neighbor algorithm matches each raw observation to the most likely map feature using the Mahalanobis distance with a Chi-squared compatibility test.
+The `PolarFeature.boxplus` operator converts the polar feature to Cartesian internally, applies the standard Cartesian compounding, then converts back to polar. The Jacobians chain through `J_c2p` accordingly.
 
-The result is a filter that dead-reckons between feature sightings and pulls its pose back toward the true trajectory whenever it sees a known landmark.
+### Variation 2 — Cartesian-Stored Features, Polar Observations (`MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM.py`)
+
+The map stores features in **Cartesian coordinates** `[x, y]` (same as the previous Cartesian lab), but the sensor returns observations in **polar coordinates** `[ρ, θ]`. The `Cartesian2DStoredPolarObservedMapFeature` class bridges the two representations:
+
+- `s2o(v)` — converts a Cartesian map feature to polar for comparison with a polar observation (`c2p`)
+- `o2s(v)` — converts a polar observation back to Cartesian for the inverse model (`p2c`)
+- `J_s2o(v)` — Jacobian of `c2p`
+- `J_o2s(v)` — Jacobian of `p2c`
+
+The generic `hfj` formula `s2o(⊖^Nx_B ⊞ ^Nx_{Fj})` then automatically handles the conversion: the Cartesian map feature is compounded with the inverted robot pose (in Cartesian), then the result is converted to polar for the innovation.
+
+The Jacobian chain for `Jhfjx` becomes:
+```
+Jhfjx = J_s2o(result) · J_1boxplus(⊖^Nx_B, ^Nx_{Fj}) · J_ominus(^Nx_B)
+       = J_c2p · J_1boxplus_cartesian · J_ominus
+```
+
+---
+
+## Comparison of the Two Variations
+
+| Aspect | Variation 1 (Polar-Polar) | Variation 2 (Cartesian-Polar) |
+|---|---|---|
+| Entry point | `MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM.py` | `MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM.py` |
+| Map feature type | `PolarFeature` `[ρ, θ]` | `CartesianFeature` `[x, y]` |
+| Sensor output | Polar `[ρ, θ]` | Polar `[ρ, θ]` |
+| `s2o` | identity | `c2p` (Cartesian → Polar) |
+| `o2s` | identity | `p2c` (Polar → Cartesian) |
+| `MapFeature` subclass | `PolarMapFeature` | `Cartesian2DStoredPolarObservedMapFeature` |
+| `Feature` class | `PolarFeature` | `CartesianFeature` |
+| Map initialization | `c2p(CartesianFeature(...))` | `CartesianFeature(...)` |
+
+In both cases the **motion model**, **FEKFMBL loop**, and **ICNN data association** are completely unchanged from the Cartesian lab.
 
 ---
 
 ## Repository Structure
 
 ```
-PR_LAB4_MBL_DISPMM_CARTOM/
+PR_LAB4_MBL_DISPMM_POLAR_AND_CART_OM/
 │
-│  ── Entry point ──
-├── MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py  # Top-level: run this
+│  ── Entry points ──
+├── MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM.py              # Variation 1: polar map, polar obs
+├── MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM.py  # Variation 2: Cartesian map, polar obs
 │
 │  ── Core localization stack ──
 ├── FEKFMBL.py                             # Feature EKF MBL: data association + localization loop
 ├── EKF_3DOFDifferentialDriveInputDisplacement.py  # Displacement motion model + compass measurement
-├── MapFeature.py                          # Feature observation/inverse models and Jacobians
-├── Feature.py                            # CartesianFeature: boxplus operator and its Jacobians
+├── MapFeature.py                          # MapFeature base + PolarMapFeature + Cartesian2DStoredPolarObservedMapFeature
+├── Feature.py                            # CartesianFeature, PolarFeature (boxplus + Jacobians)
 │
 │  ── EKF filter framework ──
 ├── EKF.py                                # EKF Prediction & Update
@@ -50,124 +83,85 @@ PR_LAB4_MBL_DISPMM_CARTOM/
 ├── IndexStruct.py                         # State/simulation/observation index mapping
 │
 │  ── Utilities ──
-├── conversions.py                         # Coordinate conversion helpers
+├── conversions.py                         # c2p, p2c, J_c2p, J_p2c and related helpers
 ├── GetEllipse.py                          # Uncertainty ellipse points for plotting
 ├── blockarray.py                          # Block-structured matrix helpers
 ├── Pose.py                               # Pose base class
-│
-│  ── Results ──
-├── Results_freq=*.png                     # Per-state error plots at different feature observation frequencies
-└── Trajectory_freq=*.png                  # XY trajectory plots at different observation frequencies
 ```
 
 ---
 
 ## Key Concepts
 
-### State vector (3 DOF)
+### State vector (both variations) — 3 DOF
 ```
 x_k = [x,  y,  ψ]^T
 ```
-Identical to the displacement EKF in LAB3 — the MBL extension does not change the state dimensionality.
 
-### Motion model `f(x_{k-1}, u_k)` — displacement input
-Encoder readings are converted to a body-frame displacement:
+### Motion model — displacement input (both variations)
 ```
-u_k = [Δx, Δy, Δψ]^T    (from wheel encoders via kinematic chain)
-x_k = x_{k-1} ⊕ u_k     (pose compounding via Pose3D.oplus)
+u_k = [Δx, Δy, Δψ]^T    (from wheel encoders)
+x_k = x_{k-1} ⊕ u_k     (pose compounding)
 ```
-Jacobians `Jfx` (3×3) and `Jfw` (3×3, rotation matrix) are the same as in LAB3.  
-Process noise `Q_k` is propagated from encoder pulse noise through the kinematic chain.
+Identical to the previous displacement labs.
 
-### Feature observation model `hfj(xk, Fj)`
-For a known map feature `^Nx_{Fj}` and predicted robot pose `^Nx_B` inside `x_k`:
+### Feature observation model `hfj` — general form
 ```
-z_{fi} = hfj(x_k) = s2o( ⊖^Nx_B  ⊞  ^Nx_{Fj} )
-```
-In Cartesian coordinates `s2o` is the identity, so this simplifies to:
-```
-z_{fi} = ^Nx_{Fj}.boxplus( x_k.ominus() )
-       = F · (x_k ⊕ [^Bx_{Fj}^T, 0]^T)
-```
-where `F = [[1,0,0],[0,1,0]]` extracts the translation from the compounded 3-DOF pose.
-
-The Jacobian `Jhfjx` (2×3) gives how the expected observation changes with the robot pose:
-```
-Jhfjx = J_s2o · J_1boxplus(⊖^Nx_B, ^Nx_{Fj}) · J_ominus(^Nx_B)
+z_{fi} = s2o( ⊖^Nx_B  ⊞  ^Nx_{Fj} ) + v_{fi}
 ```
 
-### `boxplus` operator (CartesianFeature)
-The pose-feature compounding `^Nx_B ⊞ ^Bx_F` computes the world-frame position of a feature seen at `^Bx_F` from pose `^Nx_B`:
+- For **Variation 1**: `s2o` is identity, `^Nx_{Fj}` is a `PolarFeature`, and `boxplus` operates in polar space (via Cartesian internally).
+- For **Variation 2**: `s2o = c2p` converts the Cartesian result to polar, `^Nx_{Fj}` is a `CartesianFeature`, and `boxplus` is the standard Cartesian operator.
+
+### `PolarFeature.boxplus` implementation
+Rather than deriving boxplus natively in polar space, the implementation converts to Cartesian first, applies the Cartesian boxplus, then converts the result back to polar:
+```python
+BxF_cartesian = p2c(BxF)
+NxF_cartesian = BxF_cartesian.boxplus(NxB)
+return c2p(NxF_cartesian)
 ```
-^Nx_F = F · (^Nx_B ⊕ [^Bx_F^T, 0]^T)
+The Jacobians follow the same chain rule: `J_c2p @ J_1boxplus_cartesian` and `J_c2p @ J_2boxplus_cartesian @ J_p2c`.
+
+### `Cartesian2DStoredPolarObservedMapFeature` — coordinate bridge
+The key additions over the base `MapFeature`:
+```python
+s2o(v)    = c2p(v)      # Cartesian feature → polar observation
+o2s(v)    = p2c(v)      # polar observation → Cartesian for inverse model
+J_s2o(v)  = J_c2p(v)
+J_o2s(v)  = J_p2c(v)
+GetFeatures() calls robot.ReadPolarFeature()
 ```
-Jacobians `J_1boxplus` (2×3, w.r.t. robot pose) and `J_2boxplus` (2×2, w.r.t. feature position) are used for covariance propagation and update.
-
----
-
-## Data Association — ICNN
-
-The **Individual Compatibility Nearest Neighbor** algorithm runs every step that has feature observations:
-
-1. **Build expected observations:** for each map feature `Fj`, compute `hfj(x_k_bar, Fj)` and its covariance `Phfj = Jhfjx @ Pk_bar @ Jhfjx.T`.
-
-2. **For each raw observation `zfi`:** find the map feature `Fj` that minimizes the squared Mahalanobis distance:
-   ```
-   D²_ij = (zfi − hfj)^T · (Phfj + Rfi)^{-1} · (zfi − hfj)
-   ```
-   Accept the pairing only if `D²_ij ≤ χ²_{dof, α}` (Chi-squared test at confidence `α = 0.95`).
-
-3. **Output:** association hypothesis vector `H` where `H[i] = j` means raw observation `i` is paired with map feature `j`, or `None` if no compatible match was found.
-
-Paired observations go into the EKF update; unmatched observations are discarded (in SLAM they would become new feature candidates).
-
----
-
-## Localization Loop (`FEKFMBL.Localize`)
-
-Each time step:
-
-```
-1. uk, Qk = GetInput()                          # encoder displacement + noise
-2. xk_bar, Pk_bar = Prediction(uk, Qk)          # EKF predict
-3. zm, Rm, Hm, Vm = GetMeasurements()           # compass yaw (may be None)
-4. zf, Rf = GetFeatures(xk_bar)                 # Cartesian feature observations from sensor
-5. H = DataAssociation(xk_bar, Pk_bar, zf, Rf)  # ICNN pairing
-6. zk, Rk, Hk, Vk = StackMeasurementsAndFeatures(zm, Rm, Hm, Vm, zf, Rf, H)
-   # stacks compass + paired feature obs into one joint observation vector
-7. xk, Pk = Update(zk, Rk, xk_bar, Pk_bar, Hk, Vk)  # EKF update
-```
-
-The stacked observation combines:
-- **Compass measurement** `zm = [ψ]^T` with `Hm = [[0, 0, 1]]`  
-- **Paired feature observations** `zf_p` with their per-feature Jacobians stacked vertically into `Hk`
-
-If neither compass nor any features are available, the predicted state is kept unchanged.
+The rest of the FEKFMBL pipeline (`hfj`, `Jhfjx`, `DataAssociation`, `StackMeasurementsAndFeatures`) is inherited unchanged.
 
 ---
 
 ## Class Hierarchy
 
+### Variation 1 — Polar-Polar
 ```
-GaussianFilter
-└── EKF
-      └── (mixed into EKF_3DOFDifferentialDriveInputDisplacement)
-
-Localization
-└── GFLocalization
-      ├── (mixed into EKF_3DOFDifferentialDriveInputDisplacement)
-      └── FEKFMBL
-            └── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM)
-
-DR_3DOFDifferentialDrive     ← from PR_LAB1 (encoder → displacement conversion)
-└── (mixed into EKF_3DOFDifferentialDriveInputDisplacement)
-
 MapFeature
-└── Cartesian2DMapFeature
-      └── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM)
+└── PolarMapFeature
+      └── (mixed into MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM)
+
+FEKFMBL
+└── (mixed into MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM)
+
+EKF_3DOFDifferentialDriveInputDisplacement
+└── (mixed into MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM)
 ```
 
-`MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM` inherits from all three branches simultaneously via Python multiple inheritance, combining the displacement motion model, the FEKFMBL data association loop, and the Cartesian feature observation model.
+### Variation 2 — Cartesian-Polar
+```
+MapFeature
+└── Cartesian2DStoredPolarObservedMapFeature
+      └── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM)
+
+FEKFMBL
+└── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM)
+
+EKF_3DOFDifferentialDriveInputDisplacement
+└── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM)
+```
 
 ---
 
@@ -175,10 +169,13 @@ MapFeature
 
 ```bash
 pip install roboticstoolbox-python numpy matplotlib scipy
-cd PR_LAB4_MBL_DISPMM_CARTOM
+cd PR_LAB4_MBL_DISPMM_POLAR_AND_CART_OM
 
-# Feature EKF Map-Based Localization (displacement MM, Cartesian features):
-python MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py
+# Variation 1: polar map features, polar observations
+python MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM.py
+
+# Variation 2: Cartesian map features, polar observations
+python MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM.py
 ```
 
 ---
@@ -189,12 +186,10 @@ python MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py
 |---|---|---|
 | `wheelRadius` | 0.1 m | Radius of each drive wheel |
 | `wheelBase` | 0.5 m | Track width between wheels |
-| `pulse_x_wheelTurns` | 4096 | Encoder resolution |
-| `v_yaw_std` | 5° | Compass heading noise std deviation |
 | `alpha` | 0.95 | Chi-squared confidence level for ICNN compatibility test |
 | `x0` | `[0, 0, 0]^T` | Initial pose estimate |
-| `P0` | `0_{3×3}` | Initial covariance (pose known exactly) |
+| `P0` | `0_{3×3}` | Initial covariance |
 | `dt` | 0.1 s | Simulation time step |
 | `kSteps` | 5000 | Total simulation steps |
 | `usk` | `[0.5, 0, 0.03]^T` | Constant velocity input to the simulated robot |
-| Map `M` | 6 landmarks | Cartesian positions of known features in the world frame |
+| Map `M` | 6 landmarks | World-frame positions of known features (Cartesian or Polar depending on variation) |
