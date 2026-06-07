@@ -1,167 +1,142 @@
-# PR_LAB4 — Feature EKF Map-Based Localization (Displacement Motion Model, Polar Observations)
+# PR_LAB4_SLAM — Feature EKF Simultaneous Localization and Mapping (FEKFSLAM)
 
 **Course:** Probabilistic Robotics — IFROS / MIRS Masters, Universitat de Girona  
-**Topic:** Feature EKF Map-Based Localization (FEKFMBL) with two variations: polar-stored features observed in polar, and Cartesian-stored features observed in polar
+**Topic:** Simultaneous Localization and Mapping using the Feature Extended Kalman Filter (FEKFSLAM) with Cartesian features and a displacement motion model
 
 ---
 
 ## Overview
 
-This lab extends the FEKFMBL framework from the Cartesian observation lab to work with **polar coordinate observations** (`[ρ, θ]`). The displacement motion model and ICNN data association pipeline are identical — the only difference is how features are represented in the sensor, in the map, and in the observation model.
+This lab implements **FEKFSLAM**: the robot starts with no prior map knowledge and simultaneously builds a map of Cartesian point features while localizing itself within it. In contrast to the map-based localization (MBL) labs — where a complete map was provided at initialization — here the map begins empty and grows dynamically as the robot observes previously unseen features.
 
-Two variations are implemented, each as a standalone entry point:
+The algorithm is built on top of the FEKFMBL (Feature EKF Map-Based Localization) stack. The key additions for SLAM are:
 
-### Variation 1 — Polar Features, Polar Observations (`MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM.py`)
-
-The map itself stores features in **polar coordinates** `[ρ, θ]`. The sensor also returns observations in polar coordinates. Since storage and observation share the same representation, `s2o` and `o2s` are both the identity — no coordinate conversion occurs in the observation pipeline.
-
-The `PolarFeature.boxplus` operator converts the polar feature to Cartesian internally, applies the standard Cartesian compounding, then converts back to polar. The Jacobians chain through `J_c2p` accordingly.
-
-### Variation 2 — Cartesian-Stored Features, Polar Observations (`MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM.py`)
-
-The map stores features in **Cartesian coordinates** `[x, y]` (same as the previous Cartesian lab), but the sensor returns observations in **polar coordinates** `[ρ, θ]`. The `Cartesian2DStoredPolarObservedMapFeature` class bridges the two representations:
-
-- `s2o(v)` — converts a Cartesian map feature to polar for comparison with a polar observation (`c2p`)
-- `o2s(v)` — converts a polar observation back to Cartesian for the inverse model (`p2c`)
-- `J_s2o(v)` — Jacobian of `c2p`
-- `J_o2s(v)` — Jacobian of `p2c`
-
-The generic `hfj` formula `s2o(⊖^Nx_B ⊞ ^Nx_{Fj})` then automatically handles the conversion: the Cartesian map feature is compounded with the inverted robot pose (in Cartesian), then the result is converted to polar for the innovation.
-
-The Jacobian chain for `Jhfjx` becomes:
-```
-Jhfjx = J_s2o(result) · J_1boxplus(⊖^Nx_B, ^Nx_{Fj}) · J_ominus(^Nx_B)
-       = J_c2p · J_1boxplus_cartesian · J_ominus
-```
+1. **Dynamic state vector growth** — each newly observed feature is appended to the state vector and its cross-correlations with the robot pose and existing features are properly initialized.
+2. **SLAM-aware prediction** — the EKF prediction only propagates the robot pose block through the motion model Jacobians; feature blocks remain frozen.
+3. **Inverse observation model** — when an observation cannot be matched to any known feature, the inverse model `g(x_B, z_i)` converts it to a world-frame position estimate that seeds the new feature's entry in the map.
 
 ---
 
-## Comparison of the Two Variations
+## Key Concepts
 
-| Aspect | Variation 1 (Polar-Polar) | Variation 2 (Cartesian-Polar) |
-|---|---|---|
-| Entry point | `MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM.py` | `MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM.py` |
-| Map feature type | `PolarFeature` `[ρ, θ]` | `CartesianFeature` `[x, y]` |
-| Sensor output | Polar `[ρ, θ]` | Polar `[ρ, θ]` |
-| `s2o` | identity | `c2p` (Cartesian → Polar) |
-| `o2s` | identity | `p2c` (Polar → Cartesian) |
-| `MapFeature` subclass | `PolarMapFeature` | `Cartesian2DStoredPolarObservedMapFeature` |
-| `Feature` class | `PolarFeature` | `CartesianFeature` |
-| Map initialization | `c2p(CartesianFeature(...))` | `CartesianFeature(...)` |
+### State vector — grows over time
+```
+x_k = [^Nx_B^T,  ^Nx_{F1}^T,  ...,  ^Nx_{Fn}^T]^T
+```
+- `^Nx_B` — robot pose (3 DOF: `[x, y, ψ]`)
+- `^Nx_{Fi}` — world-frame position of the *i*-th mapped feature (2 DOF: `[x, y]`)
+- The state dimension starts at 3 and grows by 2 for each newly discovered feature.
 
-In both cases the **motion model**, **FEKFMBL loop**, and **ICNN data association** are completely unchanged from the Cartesian lab.
+### Motion model — displacement input
+```
+u_k = [Δx, Δy, Δψ]^T    (from wheel encoders)
+x_k = x_{k-1} ⊕ u_k     (pose compounding via Pose3D)
+```
+
+### Observation model `hfj`
+```
+z_{fi} = s2o( ⊖^Nx_B  ⊞  ^Nx_{Fj} ) + v_{fi}
+```
+Both `^Nx_B` and `^Nx_{Fj}` are read from the current state vector (unlike MBL where `^Nx_{Fj}` came from a static map). For Cartesian features `s2o` is the identity — storage and observation share the same representation.
+
+### SLAM prediction (FEKFSLAM.Prediction)
+Only the robot-pose block is propagated through `Jfx` and `Jfw`. Feature positions are unchanged:
+```
+P_RR_bar = Jfx @ P_RR @ Jfx^T + Jfw @ Qk @ Jfw^T
+P_RM_bar = Jfx @ P_RM       # robot–feature cross-covariance
+P_MM_bar = P_MM             # feature–feature covariance frozen
+```
+
+### Adding new features (FEKFSLAM.AddNewFeatures)
+For each observation `z_i` not matched to any existing map feature:
+1. Compute the world-frame position via the inverse model: `^Nx_{Fnew} = g(x_B, z_i)`
+2. Append it to `self.M` and extend `xk` by 2 dimensions.
+3. Compute and append the new rows/columns to `Pk`:
+```
+P_new_new = J1 @ P_B @ J1^T + J2 @ Ri @ J2^T
+P_new_old = J1 @ P_{robot+all}
+```
+where `J1 = Jgx` (w.r.t. robot pose) and `J2 = Jgv` (w.r.t. observation noise).
+
+### Data association — ICNN
+Same individual-compatibility nearest-neighbour test as FEKFMBL, using Mahalanobis distance and a Chi-squared gate. SLAM uses `alpha = 0.99` (tighter than MBL's 0.95) to avoid adding spurious features prematurely.
+
+---
+
+## Class Hierarchy
+
+```
+GFLocalization ──── LocalizationLoop, Log, PlotState
+    └── FEKFMBL ─── DataAssociation, Localize, hfj (from MapFeature)
+          └── FEKFSLAM ── Prediction (SLAM-aware), AddNewFeatures, Localize (extends MBL + new features)
+                └── FEKFSLAM_3DOFDD_InputVelocityMM_2DCartesianFeatureOM   ← entry point
+
+FEKFSLAMFeature ─── hfj, Jhfjx  (reads features from state vector instead of static map)
+    └── FEKFSLAM2DCartesianFeature (also inherits Cartesian2DMapFeature)
+          └── FEKFSLAM_3DOFDD_InputVelocityMM_2DCartesianFeatureOM   ← entry point
+
+EKF_3DOFDifferentialDriveInputDisplacement ── Prediction (base), f, Jfx, Jfw
+    └── FEKFSLAM_3DOFDD_InputVelocityMM_2DCartesianFeatureOM   ← entry point
+```
+
+The entry-point class uses Python multiple inheritance (MRO) to compose the above three chains into a single runnable filter.
 
 ---
 
 ## Repository Structure
 
 ```
-PR_LAB4_MBL_DISPMM_POLAR_AND_CART_OM/
+PR_LAB4_SLAM/
 │
-│  ── Entry points ──
-├── MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM.py              # Variation 1: polar map, polar obs
-├── MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM.py  # Variation 2: Cartesian map, polar obs
+│  ── Entry point ──
+├── FEKFSLAM_3DOFDD_InputVelocityMM_2DCartesianFeatureOM.py   # main file
 │
-│  ── Core localization stack ──
-├── FEKFMBL.py                             # Feature EKF MBL: data association + localization loop
-├── EKF_3DOFDifferentialDriveInputDisplacement.py  # Displacement motion model + compass measurement
-├── MapFeature.py                          # MapFeature base + PolarMapFeature + Cartesian2DStoredPolarObservedMapFeature
-├── Feature.py                            # CartesianFeature, PolarFeature (boxplus + Jacobians)
+│  ── SLAM core ──
+├── FEKFSLAM.py                       # SLAM extensions: AddNewFeatures, SLAM-aware Prediction, Localize
+├── FEKFSLAMFeature.py                # hfj / Jhfjx reading features from state vector
 │
-│  ── EKF filter framework ──
-├── EKF.py                                # EKF Prediction & Update
-├── GaussianFilter.py                     # Abstract Gaussian filter interface
-├── GFLocalization.py                     # Localization loop + logging + plotting
-├── KF.py                                 # Kalman filter base (linear case)
+│  ── MBL base (shared with previous labs) ──
+├── FEKFMBL.py                        # Data association + MBL localization loop
+├── MapFeature.py                     # MapFeature base + Cartesian2DMapFeature
+├── Feature.py                        # CartesianFeature (boxplus + Jacobians)
 │
-│  ── Inherited from PR_LAB1 ──
-├── DR_3DOFDifferentialDrive.py            # Dead reckoning (encoder conversion)
-├── DifferentialDriveSimulatedRobot.py     # Ground-truth simulator + sensors
-├── SimulatedRobot.py                      # Abstract robot base class
-├── Pose3D.py                             # 3-DOF pose with ⊕ / ⊖ operators and Jacobians
-├── Localization.py                        # Base localization loop
-├── IndexStruct.py                         # State/simulation/observation index mapping
+│  ── Motion model ──
+├── EKF_3DOFDifferentialDriveInputDisplacement.py   # Displacement MM + compass measurement
+│
+│  ── EKF framework ──
+├── EKF.py                            # Prediction & Update
+├── GaussianFilter.py                 # Abstract Gaussian filter interface
+├── GFLocalization.py                 # Localization loop + logging + plotting
+├── KF.py                             # Kalman filter base
+│
+│  ── Robot simulation ──
+├── DR_3DOFDifferentialDrive.py       # Dead reckoning (encoder conversion)
+├── DifferentialDriveSimulatedRobot.py  # Ground-truth simulator + sensors
+├── SimulatedRobot.py                 # Abstract robot base
+├── Pose3D.py                         # 3-DOF pose with ⊕ / ⊖ operators and Jacobians
+├── Localization.py                   # Base localization loop
+├── IndexStruct.py                    # State/simulation/observation index mapping
 │
 │  ── Utilities ──
-├── conversions.py                         # c2p, p2c, J_c2p, J_p2c and related helpers
-├── GetEllipse.py                          # Uncertainty ellipse points for plotting
-├── blockarray.py                          # Block-structured matrix helpers
-├── Pose.py                               # Pose base class
+├── conversions.py                    # c2p, p2c, and related coordinate helpers
+├── GetEllipse.py                     # Uncertainty ellipse for plotting
+├── blockarray.py                     # Block-structured matrix helpers
+├── Pose.py                           # Pose base class
 ```
 
 ---
 
-## Key Concepts
+## SLAM vs. MBL — Key Differences
 
-### State vector (both variations) — 3 DOF
-```
-x_k = [x,  y,  ψ]^T
-```
-
-### Motion model — displacement input (both variations)
-```
-u_k = [Δx, Δy, Δψ]^T    (from wheel encoders)
-x_k = x_{k-1} ⊕ u_k     (pose compounding)
-```
-Identical to the previous displacement labs.
-
-### Feature observation model `hfj` — general form
-```
-z_{fi} = s2o( ⊖^Nx_B  ⊞  ^Nx_{Fj} ) + v_{fi}
-```
-
-- For **Variation 1**: `s2o` is identity, `^Nx_{Fj}` is a `PolarFeature`, and `boxplus` operates in polar space (via Cartesian internally).
-- For **Variation 2**: `s2o = c2p` converts the Cartesian result to polar, `^Nx_{Fj}` is a `CartesianFeature`, and `boxplus` is the standard Cartesian operator.
-
-### `PolarFeature.boxplus` implementation
-Rather than deriving boxplus natively in polar space, the implementation converts to Cartesian first, applies the Cartesian boxplus, then converts the result back to polar:
-```python
-BxF_cartesian = p2c(BxF)
-NxF_cartesian = BxF_cartesian.boxplus(NxB)
-return c2p(NxF_cartesian)
-```
-The Jacobians follow the same chain rule: `J_c2p @ J_1boxplus_cartesian` and `J_c2p @ J_2boxplus_cartesian @ J_p2c`.
-
-### `Cartesian2DStoredPolarObservedMapFeature` — coordinate bridge
-The key additions over the base `MapFeature`:
-```python
-s2o(v)    = c2p(v)      # Cartesian feature → polar observation
-o2s(v)    = p2c(v)      # polar observation → Cartesian for inverse model
-J_s2o(v)  = J_c2p(v)
-J_o2s(v)  = J_p2c(v)
-GetFeatures() calls robot.ReadPolarFeature()
-```
-The rest of the FEKFMBL pipeline (`hfj`, `Jhfjx`, `DataAssociation`, `StackMeasurementsAndFeatures`) is inherited unchanged.
-
----
-
-## Class Hierarchy
-
-### Variation 1 — Polar-Polar
-```
-MapFeature
-└── PolarMapFeature
-      └── (mixed into MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM)
-
-FEKFMBL
-└── (mixed into MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM)
-
-EKF_3DOFDifferentialDriveInputDisplacement
-└── (mixed into MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM)
-```
-
-### Variation 2 — Cartesian-Polar
-```
-MapFeature
-└── Cartesian2DStoredPolarObservedMapFeature
-      └── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM)
-
-FEKFMBL
-└── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM)
-
-EKF_3DOFDifferentialDriveInputDisplacement
-└── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM)
-```
+| Aspect | FEKFMBL (previous labs) | FEKFSLAM (this lab) |
+|---|---|---|
+| Initial map | Full known map provided | Empty `[]` — no prior knowledge |
+| State vector size | Fixed (3 DOF robot only) | Grows by 2 for each new feature |
+| `hfj` / `Jhfjx` | Read feature from static `self.M` | Read feature from state vector |
+| Prediction | Full `Pk` propagated | Only robot block propagated; features frozen |
+| Unmatched observations | Discarded | Trigger `AddNewFeatures`, extending `xk` and `Pk` |
+| `alpha` (ICNN gate) | 0.95 | 0.99 (tighter, to avoid spurious features) |
+| Map landmarks in `__main__` | Ground-truth AND filter initialization | Ground-truth only (simulator); filter starts empty |
 
 ---
 
@@ -169,13 +144,9 @@ EKF_3DOFDifferentialDriveInputDisplacement
 
 ```bash
 pip install roboticstoolbox-python numpy matplotlib scipy
-cd PR_LAB4_MBL_DISPMM_POLAR_AND_CART_OM
+cd PR_LAB4_SLAM
 
-# Variation 1: polar map features, polar observations
-python MBL_3DOFDDInputDisplacementMM_2DPolarFeatureOM.py
-
-# Variation 2: Cartesian map features, polar observations
-python MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM.py
+python FEKFSLAM_3DOFDD_InputVelocityMM_2DCartesianFeatureOM.py
 ```
 
 ---
@@ -186,10 +157,10 @@ python MBL_3DOFDDInputDisplacementMM_2DCartesianFeaturePolarObservedOM.py
 |---|---|---|
 | `wheelRadius` | 0.1 m | Radius of each drive wheel |
 | `wheelBase` | 0.5 m | Track width between wheels |
-| `alpha` | 0.95 | Chi-squared confidence level for ICNN compatibility test |
-| `x0` | `[0, 0, 0]^T` | Initial pose estimate |
-| `P0` | `0_{3×3}` | Initial covariance |
+| `alpha` | 0.99 | Chi-squared confidence level for ICNN compatibility test |
+| `x0` | `[0, 0, 0]^T` | Initial robot pose estimate |
+| `P0` | `0_{3×3}` | Initial pose covariance (robot starts with known pose) |
 | `dt` | 0.1 s | Simulation time step |
 | `kSteps` | 5000 | Total simulation steps |
 | `usk` | `[0.5, 0, 0.03]^T` | Constant velocity input to the simulated robot |
-| Map `M` | 6 landmarks | World-frame positions of known features (Cartesian or Polar depending on variation) |
+| Map `M` | 6 Cartesian landmarks | Used by the simulator for ground truth only — NOT passed to the filter |
