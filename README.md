@@ -1,86 +1,163 @@
-# PR_LAB1 — Differential Drive Robot Simulation & Dead Reckoning Localization
+# PR_LAB3 — EKF Localization with Constant Displacement Motion Model
 
 **Course:** Probabilistic Robotics — IFROS / MIRS Masters, Universitat de Girona
-**Topic:** Dead Reckoning using wheel encoder odometry for a 3-DOF differential drive robot
+**Topic:** Extended Kalman Filter (EKF) localization using an input displacement motion model, with compass-based measurement updates and a map-based localization framework
 
 ---
 
 ## Overview
 
-This lab simulates a differential drive mobile robot moving through a 2D environment and estimates its pose using **dead reckoning** — integrating noisy wheel encoder readings over time to track position and heading, with no external corrections or landmarks used.
+This lab extends the dead reckoning work from PR_LAB1 by replacing the open-loop integrator with a full **Extended Kalman Filter (EKF)**. The key differences from LAB1 are:
 
-The simulation runs for 5000 time steps at dt = 0.1 s. The robot is driven along a trajectory defined by a constant forward velocity and angular rate. The ground-truth pose (from the physics simulation) and the dead-reckoned estimate are plotted together so drift can be observed.
+- **Motion model input changes from velocity to displacement.** Instead of tracking velocity and integrating it, the EKF takes the body-frame displacement `u_k = [Δx, Δy, Δψ]^T` directly as input, computed from wheel encoder readings scaled by `dt`.
+- **Covariance is propagated.** The EKF tracks not just the pose estimate but its uncertainty (covariance matrix `P_k`), linearizing the non-linear motion model via Jacobians to propagate it.
+- **A compass sensor provides measurement updates.** At each step the filter reads a noisy yaw measurement from a simulated compass and uses the EKF update step to correct the heading estimate and reduce uncertainty.
+- **A map-based localization framework is scaffolded.** The `FEKFMBL` and `MapFeature` classes lay the groundwork for fusing feature observations (2D Cartesian landmarks) into the filter, with several methods left as `TODO` stubs for the next lab.
+
+The simulation runs for 5000 steps at dt = 0.1 s and produces trajectory plots and per-state estimation error plots at different compass reading frequencies.
 
 ---
 
 ## Repository Structure
 
 ```
-PR_LAB1/
-├── main.py                          # Entry point — wires up the simulation and runs the localization loop
-├── DR_3DOFDifferentialDrive.py      # Dead reckoning algorithm (encoder odometry → pose estimate)
-├── DifferentialDriveSimulatedRobot.py  # Ground-truth physics simulator + encoder/compass sensors
-├── SimulatedRobot.py                # Abstract base class for all robot simulators
-├── Pose3D.py                        # 3-DOF pose representation with ⊕ / ⊖ operators
-├── Localization.py                  # Base class for the localization loop
-├── IndexStruct.py                   # Named tuple for mapping state/simulation/observation indices
-└── Lab0_compounding.ipynb           # Lab 0: Pose compounding notebook (prerequisite)
+PR_LAB3_EKF_CONSTANT_DISPLACEMENT/
+│
+│  ── Entry point ──
+├── MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py   # Top-level runner (map-based)
+├── EKF_3DOFDifferentialDriveInputDisplacement.py           # Core EKF: motion + measurement model
+│
+│  ── EKF filter stack ──
+├── EKF.py                  # EKF Prediction & Update equations
+├── GaussianFilter.py       # Abstract Gaussian filter interface
+├── GFLocalization.py       # Localization loop + logging + plotting for Gaussian filters
+├── KF.py                   # Kalman filter base (linear case)
+│
+│  ── Map-based localization framework ──
+├── FEKFMBL.py              # Feature EKF Map-Based Localization (partially stubbed)
+├── MapFeature.py           # Feature observation/inverse models and Jacobians
+├── Feature.py              # CartesianFeature: boxplus operator and Jacobians
+│
+│  ── Inherited from PR_LAB1 ──
+├── DR_3DOFDifferentialDrive.py        # Dead reckoning (GetInput still used here)
+├── DifferentialDriveSimulatedRobot.py # Ground-truth simulator + encoder/compass sensors
+├── SimulatedRobot.py                  # Abstract robot base class
+├── Pose3D.py                          # 3-DOF pose with ⊕ / ⊖ operators
+├── Localization.py                    # Base localization loop
+├── IndexStruct.py                     # State/simulation/observation index mapping
+│
+│  ── Utilities ──
+├── conversions.py          # Coordinate conversion helpers
+├── GetEllipse.py           # Uncertainty ellipse points for plotting
+├── blockarray.py           # Block-structured matrix helpers
+├── Pose.py                 # Pose base class
+│
+│  ── Results ──
+├── Results_freq=*.png      # Per-state error plots at different compass frequencies
+└── Trajectory_freq=*.png   # XY trajectory plots at different compass frequencies
 ```
 
 ---
 
 ## File Descriptions
 
-### `main.py`
-Entry point. Creates the simulated environment:
-- Defines a map of 6 2D point features (not used for localization in this lab — carried over for the lab framework).
-- Instantiates `DifferentialDriveSimulatedRobot` and `DR_3DOFDifferentialDrive`.
-- Calls `LocalizationLoop` with a constant input velocity `[0.5, 0, 0.03]^T` (forward speed, lateral speed, yaw rate) to run the simulation.
+### `MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py`
+Top-level entry point for the **map-based** version. Wires together three parent classes via multiple inheritance:
+- `Cartesian2DMapFeature` — reads 2D Cartesian landmark observations from the robot.
+- `FEKFMBL` — Feature EKF map-based localization framework.
+- `EKF_3DOFDifferentialDriveInputDisplacement` — the core EKF with displacement motion model.
 
-### `DR_3DOFDifferentialDrive.py`
-Implements **dead reckoning** for a 3-DOF differential drive robot. Inherits from `Localization`.
+Sets up 6 landmark features in the world frame, creates the simulated robot, and calls `LocalizationLoop(x0, P0, usk)`.
 
-- **`GetInput()`** — Reads left/right encoder pulse counts from the simulated robot.
-- **`Localize(xk_1, uk)`** — The motion model (core of dead reckoning):
-  1. Converts pulse counts → wheel angular displacements → left/right linear velocities.
-  2. Computes forward velocity `v = (v_R + v_L) / 2` and angular velocity `w = (v_R - v_L) / wheelBase`.
-  3. Propagates the previous pose estimate via the `oplus` pose compounding operator: `η_k = η_{k-1} ⊕ (ν_k · dt)`.
-  4. Returns the updated state `[x, y, ψ, v, 0, w]^T`.
+### `EKF_3DOFDifferentialDriveInputDisplacement.py`
+The core student implementation. Inherits from `GFLocalization`, `DR_3DOFDifferentialDrive`, and `EKF`.
 
-  If no encoder reading is available (rate limiting), the previous velocity is reused.
+**`GetInput()`**
+- Reads left/right encoder pulses from the simulated robot.
+- Converts pulses → wheel velocities → forward speed `v` and angular rate `w`.
+- Computes the body-frame displacement: `u_k = [v·dt, 0, w·dt]^T`.
+- Propagates encoder noise through the kinematic chain using the "magic table" (covariance propagation):
+  `Q_pulses → Q_wheel_velocity → Q_body_velocity → Q_displacement`
+- Returns `(u_k, Q_displacement)`.
 
-### `DifferentialDriveSimulatedRobot.py`
-Ground-truth physics simulator for the differential drive robot. Inherits from `SimulatedRobot`.
+**`f(xk_1, uk)`** — Motion model
+```
+x̂_k = x_{k-1} ⊕ u_k
+```
+The displacement `u_k` expressed in the body frame is compounded onto the previous pose using the `Pose3D.oplus` operator.
 
-- **`fs(xsk_1, usk)`** — Simulates true robot motion using a first-order velocity tracking model with additive Gaussian acceleration noise (`Q_sk`). Updates position via `oplus` and velocity via a gain-based approach: `ν_k = ν_{k-1} + K(ν_d − ν_{k-1}) + w_k·dt`.
-- **`ReadEncoders()`** — Simulates wheel encoder readings. Converts the true wheel velocities to pulse counts using the encoder resolution (1024 pulses/turn), then adds Gaussian noise (`Re = diag(22², 22²)`). Rate-limited to `encoder_reading_frequency`.
-- **`ReadCompass()`** — Simulates a noisy compass (heading sensor). Not used in this lab but available in the framework.
-- **`PlotRobot()`** — Updates the live animation icon at the current simulated pose.
+**`Jfx(xk_1, uk)`** — Jacobian of `f` w.r.t. the state:
+```
+∂f/∂x = [[1, 0, -Δx·sin(ψ) - Δy·cos(ψ)],
+          [0, 1,  Δx·cos(ψ) - Δy·sin(ψ)],
+          [0, 0,  1                      ]]
+```
 
-### `SimulatedRobot.py`
-Abstract base class for all robot simulators in this lab series.
-- Sets up the matplotlib animation figure, trajectory buffers, and the vehicle icon overlay.
-- Defines the `fs()` interface (overridden by each robot type) and a helper `_PlotSample()` for drawing uncertainty samples.
+**`Jfw(xk_1, uk)`** — Jacobian of `f` w.r.t. the noise (rotation matrix from body to world):
+```
+∂f/∂w = [[cos(ψ), -sin(ψ), 0],
+          [sin(ψ),  cos(ψ), 0],
+          [0,       0,      1]]
+```
 
-### `Pose3D.py`
-Represents a 3-DOF robot pose `[x, y, ψ]^T` as a NumPy ndarray subclass.
+**`h(xk)`** — Observation model: returns `xk[2]` (the yaw angle), since the compass directly observes heading.
 
-- **`oplus(AxB, BxC)`** — Pose composition (frame chaining). Applies the rotation of frame A→B to BxC's translation, then sums headings. Wraps the result to `[-π, π]`.
-- **`ominus(AxB)`** — Inverse pose composition. Returns the pose of A expressed in B's frame.
+**`GetMeasurements()`**
+- Reads a compass yaw measurement from the robot.
+- Returns `(z_k, R_k, H_k, V_k)` where `H_k = [[0, 0, 1]]` (the compass observes yaw only) and `V_k = [[1]]`.
 
-These operators are the building blocks of the dead-reckoning integration step.
+### `EKF.py`
+Implements the EKF **Prediction** and **Update** equations.
 
-### `Localization.py`
-Base class for the localization algorithm loop.
+**`Prediction(uk, Qk)`**
+```
+x̂_k|k-1 = f(x_{k-1}, u_k)
+P_k|k-1 = Jfx · P_{k-1} · Jfx^T + Jfw · Q_k · Jfw^T
+```
 
-- **`LocalizationLoop(x0, usk)`** — Runs the simulation for `kSteps` iterations: simulates the robot (`fs`), reads input (`GetInput`), estimates the pose (`Localize`), and updates the trajectory plot.
-- **`PlotTrajectory()`** — Live-plots the estimated (blue) trajectory every `visualizationInterval` steps.
+**`Update(zk, Rk, xk_bar, Pk_bar, Hk, Vk)`**
+```
+K = P_k|k-1 · H^T · (H · P_k|k-1 · H^T + V · R_k · V^T)^-1
+x_k = x̂_k|k-1 + K · wrap(z_k - h(x̂_k|k-1))
+P_k = (I - K·H) · P_k|k-1
+```
+Angle wrapping is applied to the innovation to avoid discontinuities at ±π.
 
-### `IndexStruct.py`
-A lightweight `NamedTuple` with fields `(state, simulation, observation)`. Maps elements of the estimated state vector to their counterparts in the simulation and observation vectors, used by the logging and plotting framework.
+### `GFLocalization.py`
+Extends `Localization` with a Gaussian-filter-specific loop:
+- `LocalizationLoop` calls `fs` (simulate), then `Localize` (predict + update) for each step.
+- `Localize` orchestrates `GetInput → Prediction → GetMeasurements → Update`.
+- Logs ground truth, estimates, covariances, and predictions to arrays.
+- `PlotState` produces per-DOF plots of: estimate + 3σ bounds vs. ground truth, estimation error + 3σ envelope, and an error histogram.
+- `PlotXY` plots the XY trajectory.
+- `PlotUncertainty` draws the live uncertainty ellipse around the robot pose every `visualizationInterval` steps.
 
-### `Lab0_compounding.ipynb`
-A Jupyter notebook covering **Lab 0: Pose Compounding**. Walks through the mathematics and implementation of the `oplus` and `ominus` operators in 2D, serving as the prerequisite for understanding how poses are chained in the dead-reckoning integrator.
+### `GaussianFilter.py`
+Minimal abstract base class defining the `Prediction` and `Update` interface. All filter variants (`KF`, `EKF`) implement these.
+
+### `FEKFMBL.py`
+Scaffold for **Feature EKF Map-Based Localization**. Extends `GFLocalization` and `MapFeature`. Most methods (`h`, `hm`, `ICNN`, `DataAssociation`, `StackMeasurementsAndFeatures`, `SplitFeatures`, `Localize`) are left as `TODO` stubs — implementing data association and the joint observation model is the task for the subsequent lab. Plotting helpers for feature observation ellipses and expected feature observation ellipses are fully implemented.
+
+### `MapFeature.py`
+Provides the mathematical interface for landmark observations:
+- `hfj(xk, Fj)` — expected observation of feature `Fj` from pose `xk`: `s2o(⊖xk ⊕ M[Fj])`.
+- `Jhfjx`, `Jhfv` — Jacobians of the feature observation function.
+- `g(xk, BxFj)` — inverse observation model: `xk ⊕ o2s(BxFj)`.
+- `Jgx`, `Jgv` — Jacobians of the inverse model.
+- `Cartesian2DMapFeature` subclass: overrides `GetFeatures` to call the robot's Cartesian feature sensor.
+
+### `Feature.py`
+Defines the `Feature` interface (abstract `boxplus`, Jacobians, `ToCartesian`) and implements `CartesianFeature` as a NumPy ndarray subclass with:
+- `boxplus(NxB)` — transforms a body-frame feature position to the world frame: `F · (NxB ⊕ BxF)` where `F` projects out the position dimensions.
+- `J_1boxplus`, `J_2boxplus` — Jacobians w.r.t. robot pose and feature position.
+
+### Utilities
+| File | Purpose |
+|---|---|
+| `conversions.py` | Angle and coordinate conversion helpers |
+| `GetEllipse.py` | Computes 2D uncertainty ellipse points from a mean and covariance |
+| `blockarray.py` | Helpers for indexing block-structured stacked observation vectors |
+| `Pose.py` | Pose base class used by the Feature framework |
 
 ---
 
@@ -88,11 +165,30 @@ A Jupyter notebook covering **Lab 0: Pose Compounding**. Walks through the mathe
 
 | Concept | Where it appears |
 |---|---|
-| Pose compounding (`⊕` / `⊖`) | `Pose3D.oplus`, `Pose3D.ominus` |
-| Dead reckoning via encoder odometry | `DR_3DOFDifferentialDrive.Localize` |
-| Encoder pulse → velocity conversion | `DR_3DOFDifferentialDrive.Localize`, `DifferentialDriveSimulatedRobot.ReadEncoders` |
-| Simulated sensor noise | `DifferentialDriveSimulatedRobot.Re` (encoders), `Qsk` (motion) |
-| Drift accumulation over time | Observable by comparing ground-truth vs estimated trajectory in the live plot |
+| Input displacement motion model `u_k = ν·dt` | `EKF_3DOFDifferentialDriveInputDisplacement.GetInput`, `f` |
+| EKF covariance prediction via Jacobians | `EKF.Prediction`, `EKF_3DOFDifferentialDriveInputDisplacement.Jfx`, `Jfw` |
+| Compass-based yaw update | `EKF_3DOFDifferentialDriveInputDisplacement.h`, `GetMeasurements` |
+| Kalman gain + innovation update | `EKF.Update` |
+| Angle-wrapping in innovation | `EKF.Update` (`wrap_angle`) |
+| Noise propagation through kinematic chain | `EKF_3DOFDifferentialDriveInputDisplacement.GetInput` (magic table) |
+| Uncertainty ellipse visualization | `GFLocalization.PlotUncertainty`, `GetEllipse` |
+| Feature observation model + Jacobians | `MapFeature.hfj`, `Jhfjx`, `g`, `Jgv` |
+| Pose-feature compounding (boxplus) | `Feature.boxplus`, `CartesianFeature.boxplus` |
+
+---
+
+## Effect of Compass Reading Frequency
+
+The lab includes result plots at four compass reading frequencies:
+
+| Frequency | Behaviour |
+|---|---|
+| `1/500` Hz (very rare) | Essentially no compass updates; behaves close to dead reckoning, heading drifts |
+| `0.1` Hz | Occasional corrections; visible yaw drift between updates |
+| `1` Hz | Good heading tracking; position estimate tightens significantly |
+| `10` Hz | Near-continuous correction; 3σ bounds remain narrow throughout |
+
+These results illustrate how sensor update frequency directly controls uncertainty growth — a core insight of the EKF framework.
 
 ---
 
@@ -100,15 +196,39 @@ A Jupyter notebook covering **Lab 0: Pose Compounding**. Walks through the mathe
 
 ```bash
 pip install roboticstoolbox-python numpy matplotlib scipy
-cd PR_LAB1
-python main.py
+cd PR_LAB3_EKF_CONSTANT_DISPLACEMENT
+
+# Compass-corrected EKF only (no map features):
+python EKF_3DOFDifferentialDriveInputDisplacement.py
+
+# EKF with Cartesian map-feature framework:
+python MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py
 ```
 
-A matplotlib window will open showing:
-- The **orange** dots: ground-truth robot trajectory (from the physics simulation).
-- The **blue** dots: dead-reckoned estimated trajectory.
+---
 
-Drift between the two grows over time, illustrating why dead reckoning alone is insufficient for long-horizon localization.
+## Class Hierarchy
+
+```
+GaussianFilter
+├── KF
+└── EKF
+      └── (mixed into EKF_3DOFDifferentialDriveInputDisplacement)
+
+Localization
+└── GFLocalization
+      ├── (mixed into EKF_3DOFDifferentialDriveInputDisplacement)
+      └── FEKFMBL
+            └── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM)
+
+DR_3DOFDifferentialDrive     ← from PR_LAB1
+└── (mixed into EKF_3DOFDifferentialDriveInputDisplacement)
+
+MapFeature
+├── Cartesian2DMapFeature
+│     └── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM)
+└── (provides feature obs model to FEKFMBL)
+```
 
 ---
 
@@ -116,11 +236,11 @@ Drift between the two grows over time, illustrating why dead reckoning alone is 
 
 | Parameter | Value | Description |
 |---|---|---|
-| `wheelRadius` | 0.1 m | Radius of each wheel |
-| `wheelBase` | 0.5 m | Distance between the two wheels |
-| `pulse_x_wheelTurns` | 4096 (DR) / 1024 (sim) | Encoder resolution (pulses per full wheel revolution) |
-| `encoder_reading_frequency` | 1 Hz | How often encoder readings are sampled |
-| `Qsk` | diag(0.1², 0.01², 1°²) | Motion model noise covariance |
+| `wheelRadius` | 0.1 m | Radius of each drive wheel |
+| `wheelBase` | 0.5 m | Track width between wheels |
+| `pulse_x_wheelTurns` | 1024 (sim) / 4096 (DR) | Encoder resolution |
 | `Re` | diag(22², 22²) | Encoder measurement noise covariance |
+| `v_yaw_std` | 5° | Compass heading noise std deviation |
 | `dt` | 0.1 s | Simulation time step |
 | `kSteps` | 5000 | Total simulation steps |
+| `alpha` | 0.95 | Chi-squared confidence level for data association |
