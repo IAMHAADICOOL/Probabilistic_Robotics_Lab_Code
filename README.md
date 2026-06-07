@@ -200,9 +200,6 @@ cd PR_LAB3_EKF_CONSTANT_DISPLACEMENT
 
 # Compass-corrected EKF only (no map features):
 python EKF_3DOFDifferentialDriveInputDisplacement.py
-
-# EKF with Cartesian map-feature framework:
-python MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py
 ```
 
 ---
