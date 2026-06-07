@@ -24,7 +24,7 @@ The result is a filter that dead-reckons between feature sightings and pulls its
 ## Repository Structure
 
 ```
-PR_LAB4_MBL_DISPMM_CARTMM/
+PR_LAB4_MBL_DISPMM_CARTOM/
 │
 │  ── Entry point ──
 ├── MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py  # Top-level: run this
@@ -175,7 +175,7 @@ MapFeature
 
 ```bash
 pip install roboticstoolbox-python numpy matplotlib scipy
-cd PR_LAB4_MBL_DISPMM_CARTMM
+cd PR_LAB4_MBL_DISPMM_CARTOM
 
 # Feature EKF Map-Based Localization (displacement MM, Cartesian features):
 python MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py
