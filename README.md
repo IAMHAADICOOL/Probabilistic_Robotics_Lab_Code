@@ -230,9 +230,6 @@ cd PR_LAB3_CONSTANT_VELOCITY
 
 # 6-state constant velocity EKF (compass + encoder fusion):
 python EKF_3DOFDifferentialDriveCtVelocity.py
-
-# With Cartesian map-feature framework:
-python MBL_3DOFDDCtVelocityMM_2DCartesianFeatureOM.py
 ```
 
 ---
