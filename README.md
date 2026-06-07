@@ -1,36 +1,38 @@
-# PR_LAB3 — EKF Localization with Constant Displacement Motion Model
+# PR_LAB3 — EKF Localization with Constant Velocity Motion Model
 
 **Course:** Probabilistic Robotics — IFROS / MIRS Masters, Universitat de Girona
-**Topic:** Extended Kalman Filter (EKF) localization using an input displacement motion model, with compass-based measurement updates and a map-based localization framework
+**Topic:** Extended Kalman Filter (EKF) localization using a constant velocity motion model, with multi-sensor fusion (compass + wheel encoders treated as velocity observations)
 
 ---
 
 ## Overview
 
-This lab extends the dead reckoning work from PR_LAB1 by replacing the open-loop integrator with a full **Extended Kalman Filter (EKF)**. The key differences from LAB1 are:
+This lab extends the dead reckoning work from PR_LAB1 using an Extended Kalman Filter, but with a fundamentally different approach from the constant displacement version:
 
-- **Motion model input changes from velocity to displacement.** Instead of tracking velocity and integrating it, the EKF takes the body-frame displacement `u_k = [Δx, Δy, Δψ]^T` directly as input, computed from wheel encoder readings scaled by `dt`.
-- **Covariance is propagated.** The EKF tracks not just the pose estimate but its uncertainty (covariance matrix `P_k`), linearizing the non-linear motion model via Jacobians to propagate it.
-- **A compass sensor provides measurement updates.** At each step the filter reads a noisy yaw measurement from a simulated compass and uses the EKF update step to correct the heading estimate and reduce uncertainty.
-- **A map-based localization framework is scaffolded.** The `FEKFMBL` and `MapFeature` classes lay the groundwork for fusing feature observations (2D Cartesian landmarks) into the filter, with several methods left as `TODO` stubs for the next lab.
+**The state vector is expanded to 6 DOF:** `x_k = [x, y, ψ, v_x, v_y, ω]^T`  
+The robot's body-frame velocities are now *part of the estimated state*, not computed separately from encoders.
 
-The simulation runs for 5000 steps at dt = 0.1 s and produces trajectory plots and per-state estimation error plots at different compass reading frequencies.
+**The motion model has no external input.** The constant velocity assumption means the robot's velocity is predicted to remain unchanged between steps. Pose is propagated by integrating the velocity in the current state. This is fundamentally different from the displacement model where encoder readings drove the prediction.
+
+**Wheel encoders are fused as velocity measurements in the update step**, not used as motion model inputs. The filter corrects the velocity component of its state by comparing the encoder-derived velocity against the expected velocity from the current state estimate. The compass provides a yaw correction as a second, independent measurement.
+
+The result is a 6-state EKF that simultaneously estimates pose and velocity, with four possible sensor fusion configurations per step depending on sensor availability.
 
 ---
 
 ## Repository Structure
 
 ```
-PR_LAB3_EKF_CONSTANT_DISPLACEMENT/
+PR_LAB3_CONSTANT_VELOCITY/
 │
-│  ── Entry point ──
-├── MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py   # Top-level runner (map-based)
-├── EKF_3DOFDifferentialDriveInputDisplacement.py           # Core EKF: motion + measurement model
+│  ── Entry points ──
+├── EKF_3DOFDifferentialDriveCtVelocity.py    # Core EKF: constant velocity model + multi-sensor update
+├── MBL_3DOFDDCtVelocityMM_2DCartesianFeatureOM.py  # Map-based localization entry point
 │
-│  ── EKF filter stack ──
-├── EKF.py                  # EKF Prediction & Update equations
+│  ── EKF filter stack (shared framework) ──
+├── EKF.py                  # EKF Prediction & Update (extended Update signature)
 ├── GaussianFilter.py       # Abstract Gaussian filter interface
-├── GFLocalization.py       # Localization loop + logging + plotting for Gaussian filters
+├── GFLocalization.py       # Localization loop + logging + plotting
 ├── KF.py                   # Kalman filter base (linear case)
 │
 │  ── Map-based localization framework ──
@@ -39,10 +41,10 @@ PR_LAB3_EKF_CONSTANT_DISPLACEMENT/
 ├── Feature.py              # CartesianFeature: boxplus operator and Jacobians
 │
 │  ── Inherited from PR_LAB1 ──
-├── DR_3DOFDifferentialDrive.py        # Dead reckoning (GetInput still used here)
+├── DR_3DOFDifferentialDrive.py        # Dead reckoning (encoder conversion used in GetMeasurements)
 ├── DifferentialDriveSimulatedRobot.py # Ground-truth simulator + encoder/compass sensors
 ├── SimulatedRobot.py                  # Abstract robot base class
-├── Pose3D.py                          # 3-DOF pose with ⊕ / ⊖ operators
+├── Pose3D.py                          # 3-DOF pose with ⊕ / ⊖ operators and Jacobians
 ├── Localization.py                    # Base localization loop
 ├── IndexStruct.py                     # State/simulation/observation index mapping
 │
@@ -53,157 +55,147 @@ PR_LAB3_EKF_CONSTANT_DISPLACEMENT/
 ├── Pose.py                 # Pose base class
 │
 │  ── Results ──
-├── Results_freq=*.png      # Per-state error plots at different compass frequencies
-└── Trajectory_freq=*.png   # XY trajectory plots at different compass frequencies
+├── Results_freq=*.png      # Per-state error plots at different compass/encoder frequencies
+└── Trajectory_freq=*.png   # XY trajectory plots at different sensor frequencies
 ```
+
+---
+
+## The Constant Velocity Motion Model — Key Concepts
+
+### State vector (6 DOF)
+```
+x_k = [x,  y,  ψ,  v_x,  v_y,  ω]^T
+        ←pose (η)→  ←body velocities (ν)→
+```
+
+### Motion model `f(x_{k-1}, u_k)` — no external input
+The velocity is assumed constant between steps; pose is integrated from velocity:
+```
+ν_k     = ν_{k-1}                       (velocity unchanged)
+u_k     = ν_{k-1} · dt                  (effective displacement)
+η_k     = η_{k-1} ⊕ u_k                (pose compounded)
+x_k     = [η_k^T,  ν_k^T]^T
+```
+`GetInput()` returns `u_k = 0` (no control input) and a 3×3 acceleration noise covariance `Q_k`:
+
+| σ_u_dot | σ_v_dot | σ_r_dot |
+|---|---|---|
+| 0.1 m/s² | 0.01 m/s² | 1°/s² |
+
+### Jacobians
+
+**`Jfx`** — how the full 6-state propagates (6×6):
+```
+       ∂η_k/∂η     ∂η_k/∂ν
+Jfx = [J_1⊕(η,u)  J_2⊕(η) · dt ]
+      [  0_{3×3}       I_{3×3}   ]
+```
+Top-left: how the previous pose affects the new pose (from the `oplus` Jacobian w.r.t. the left argument).  
+Top-right: how the previous velocity affects the new pose (via `J_2⊕ · dt`, the `oplus` Jacobian w.r.t. the displacement, scaled by dt).  
+Bottom: velocity state propagates as identity.
+
+**`Jfw`** — how the 3D acceleration noise `w_k` maps into the 6-state (6×3):
+```
+       ∂η_k/∂w
+Jfw = [J_2⊕(η) · dt²/2]   (acceleration → pose, second-order)
+      [    I · dt        ]   (acceleration → velocity, first-order)
+```
+
+---
+
+## Multi-Sensor Measurement Fusion
+
+This is the defining feature of this lab. `GetMeasurements()` returns a dynamically sized observation vector depending on which sensors fired:
+
+### Case 1 — Both compass and encoders available
+```
+z_k = [ψ_compass, v_x, v_y, ω]^T      (4×1)
+h(x_k) = x_k[2:6]                      (yaw + all velocities)
+H_k = [[0, 0, 1, 0, 0, 0],             (compass → yaw)
+        [0, 0, 0, 1, 0, 0],             (encoder → v_x)
+        [0, 0, 0, 0, 1, 0],             (encoder → v_y)
+        [0, 0, 0, 0, 0, 1]]             (encoder → ω)
+R_k = block_diag(R_compass, Q_velocity)  (4×4)
+```
+
+### Case 2 — Compass only (no encoder reading this step)
+```
+z_k = [ψ_compass]                      (1×1)
+H_k = [[0, 0, 1, 0, 0, 0]]
+R_k = R_compass                         (1×1)
+```
+
+### Case 3 — Encoders only (no compass reading this step)
+```
+z_k = [v_x, v_y, ω]^T                 (3×1)
+H_k = [[0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 1]]
+R_k = Q_velocity                        (3×3)
+```
+
+### Case 4 — Neither sensor fires
+```
+z_k = None  →  skip update, keep predicted state
+```
+
+The encoder-derived velocity covariance `Q_velocity` is propagated from pulse noise through the kinematic chain using the same "magic table" approach as the displacement lab:
+`Q_pulses → Q_wheel_velocities → Q_body_velocities`
+
+### `EKF.Update` — extended signature
+Because `h(x_k)` depends on which sensors are active, the Update method takes two extra boolean flags:
+```python
+Update(zk, Rk, xk_bar, Pk_bar, Hk, Vk, received_encoder_readings, received_heading_data)
+```
+Angle wrapping on the compass innovation is applied only when heading data was received.
+
+---
+
+## Key Differences from the Constant Displacement Lab
+
+| Aspect | Constant Displacement (LAB3-CD) | Constant Velocity (this lab) |
+|---|---|---|
+| State dimension | 3 (pose only) | 6 (pose + velocity) |
+| Encoder role | Motion model input (`u_k`) | Measurement in update step |
+| `GetInput` | Reads encoders, computes displacement | Returns zero input + acceleration noise |
+| `GetMeasurements` | Reads compass only | Reads compass + encoders (velocity obs.) |
+| Motion model | `x_k = x_{k-1} ⊕ u_k` | `η_k = η_{k-1} ⊕ ν_{k-1}·dt`, `ν_k = ν_{k-1}` |
+| Process noise `Q_k` | 3×3 displacement noise | 3×3 acceleration noise |
+| Observation `H_k` | Fixed 1×3 (compass → yaw) | Dynamic 1×6 / 3×6 / 4×6 |
+| Velocity estimate | Not tracked | Estimated and corrected by EKF |
 
 ---
 
 ## File Descriptions
 
-### `MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py`
-Top-level entry point for the **map-based** version. Wires together three parent classes via multiple inheritance:
-- `Cartesian2DMapFeature` — reads 2D Cartesian landmark observations from the robot.
-- `FEKFMBL` — Feature EKF map-based localization framework.
-- `EKF_3DOFDifferentialDriveInputDisplacement` — the core EKF with displacement motion model.
-
-Sets up 6 landmark features in the world frame, creates the simulated robot, and calls `LocalizationLoop(x0, P0, usk)`.
-
-### `EKF_3DOFDifferentialDriveInputDisplacement.py`
+### `EKF_3DOFDifferentialDriveCtVelocity.py`
 The core student implementation. Inherits from `GFLocalization`, `DR_3DOFDifferentialDrive`, and `EKF`.
 
-**`GetInput()`**
-- Reads left/right encoder pulses from the simulated robot.
-- Converts pulses → wheel velocities → forward speed `v` and angular rate `w`.
-- Computes the body-frame displacement: `u_k = [v·dt, 0, w·dt]^T`.
-- Propagates encoder noise through the kinematic chain using the "magic table" (covariance propagation):
-  `Q_pulses → Q_wheel_velocity → Q_body_velocity → Q_displacement`
-- Returns `(u_k, Q_displacement)`.
+**`f(xk_1, uk)`** — Constant velocity prediction:
+extracts `ν_{k-1}` from state, computes displacement `u = ν·dt`, compounds pose with `oplus`, returns `[η_k^T, ν_{k-1}^T]^T`.
 
-**`f(xk_1, uk)`** — Motion model
-```
-x̂_k = x_{k-1} ⊕ u_k
-```
-The displacement `u_k` expressed in the body frame is compounded onto the previous pose using the `Pose3D.oplus` operator.
+**`Jfx(xk_1, uk)`** — 6×6 state transition Jacobian. Uses `Pose3D.J_1oplus` and `Pose3D.J_2oplus` for the pose-pose and velocity-pose blocks respectively.
 
-**`Jfx(xk_1, uk)`** — Jacobian of `f` w.r.t. the state:
-```
-∂f/∂x = [[1, 0, -Δx·sin(ψ) - Δy·cos(ψ)],
-          [0, 1,  Δx·cos(ψ) - Δy·sin(ψ)],
-          [0, 0,  1                      ]]
-```
+**`Jfw(xk_1, uk)`** — 6×3 noise Jacobian. Maps 3D acceleration noise to pose (via `J_2oplus · dt²/2`) and velocity (via `I · dt`).
 
-**`Jfw(xk_1, uk)`** — Jacobian of `f` w.r.t. the noise (rotation matrix from body to world):
-```
-∂f/∂w = [[cos(ψ), -sin(ψ), 0],
-          [sin(ψ),  cos(ψ), 0],
-          [0,       0,      1]]
-```
+**`h(xk, received_encoder_readings, received_heading_data)`** — Adaptive observation model returning the appropriate state subvector based on active sensors.
 
-**`h(xk)`** — Observation model: returns `xk[2]` (the yaw angle), since the compass directly observes heading.
+**`GetInput()`** — Returns `u_k = 0` (constant velocity needs no input) and hardcoded `Q_k = diag(0.1², 0.01², 1°²)` (acceleration noise).
 
-**`GetMeasurements()`**
-- Reads a compass yaw measurement from the robot.
-- Returns `(z_k, R_k, H_k, V_k)` where `H_k = [[0, 0, 1]]` (the compass observes yaw only) and `V_k = [[1]]`.
+**`GetMeasurements()`** — Reads compass and encoders, converts encoder pulses to `[v_x, v_y, ω]`, propagates noise through the kinematic chain, then assembles `(z_k, R_k, H_k, V_k)` for whichever combination of sensors fired.
+
+### `MBL_3DOFDDCtVelocityMM_2DCartesianFeatureOM.py`
+Top-level entry point combining `Cartesian2DMapFeature`, `FEKFMBL`, and `EKF_3DOFDifferentialDriveCtVelocity` via multiple inheritance. Sets up 6 landmarks and calls `LocalizationLoop`.
 
 ### `EKF.py`
-Implements the EKF **Prediction** and **Update** equations.
-
-**`Prediction(uk, Qk)`**
-```
-x̂_k|k-1 = f(x_{k-1}, u_k)
-P_k|k-1 = Jfx · P_{k-1} · Jfx^T + Jfw · Q_k · Jfw^T
-```
-
-**`Update(zk, Rk, xk_bar, Pk_bar, Hk, Vk)`**
-```
-K = P_k|k-1 · H^T · (H · P_k|k-1 · H^T + V · R_k · V^T)^-1
-x_k = x̂_k|k-1 + K · wrap(z_k - h(x̂_k|k-1))
-P_k = (I - K·H) · P_k|k-1
-```
-Angle wrapping is applied to the innovation to avoid discontinuities at ±π.
+Identical prediction step to the displacement lab. The **Update** method has an extended signature with `received_encoder_readings` and `received_heading_data` flags, forwarded to `h()` to select the correct observation subvector.
 
 ### `GFLocalization.py`
-Extends `Localization` with a Gaussian-filter-specific loop:
-- `LocalizationLoop` calls `fs` (simulate), then `Localize` (predict + update) for each step.
-- `Localize` orchestrates `GetInput → Prediction → GetMeasurements → Update`.
-- Logs ground truth, estimates, covariances, and predictions to arrays.
-- `PlotState` produces per-DOF plots of: estimate + 3σ bounds vs. ground truth, estimation error + 3σ envelope, and an error histogram.
-- `PlotXY` plots the XY trajectory.
-- `PlotUncertainty` draws the live uncertainty ellipse around the robot pose every `visualizationInterval` steps.
+Same localization loop as the displacement lab, but unpacks 6 return values from `GetMeasurements()` (the extra two sensor-availability flags) and passes them through to `Update`.
 
-### `GaussianFilter.py`
-Minimal abstract base class defining the `Prediction` and `Update` interface. All filter variants (`KF`, `EKF`) implement these.
-
-### `FEKFMBL.py`
-Scaffold for **Feature EKF Map-Based Localization**. Extends `GFLocalization` and `MapFeature`. Most methods (`h`, `hm`, `ICNN`, `DataAssociation`, `StackMeasurementsAndFeatures`, `SplitFeatures`, `Localize`) are left as `TODO` stubs — implementing data association and the joint observation model is the task for the subsequent lab. Plotting helpers for feature observation ellipses and expected feature observation ellipses are fully implemented.
-
-### `MapFeature.py`
-Provides the mathematical interface for landmark observations:
-- `hfj(xk, Fj)` — expected observation of feature `Fj` from pose `xk`: `s2o(⊖xk ⊕ M[Fj])`.
-- `Jhfjx`, `Jhfv` — Jacobians of the feature observation function.
-- `g(xk, BxFj)` — inverse observation model: `xk ⊕ o2s(BxFj)`.
-- `Jgx`, `Jgv` — Jacobians of the inverse model.
-- `Cartesian2DMapFeature` subclass: overrides `GetFeatures` to call the robot's Cartesian feature sensor.
-
-### `Feature.py`
-Defines the `Feature` interface (abstract `boxplus`, Jacobians, `ToCartesian`) and implements `CartesianFeature` as a NumPy ndarray subclass with:
-- `boxplus(NxB)` — transforms a body-frame feature position to the world frame: `F · (NxB ⊕ BxF)` where `F` projects out the position dimensions.
-- `J_1boxplus`, `J_2boxplus` — Jacobians w.r.t. robot pose and feature position.
-
-### Utilities
-| File | Purpose |
-|---|---|
-| `conversions.py` | Angle and coordinate conversion helpers |
-| `GetEllipse.py` | Computes 2D uncertainty ellipse points from a mean and covariance |
-| `blockarray.py` | Helpers for indexing block-structured stacked observation vectors |
-| `Pose.py` | Pose base class used by the Feature framework |
-
----
-
-## Key Concepts
-
-| Concept | Where it appears |
-|---|---|
-| Input displacement motion model `u_k = ν·dt` | `EKF_3DOFDifferentialDriveInputDisplacement.GetInput`, `f` |
-| EKF covariance prediction via Jacobians | `EKF.Prediction`, `EKF_3DOFDifferentialDriveInputDisplacement.Jfx`, `Jfw` |
-| Compass-based yaw update | `EKF_3DOFDifferentialDriveInputDisplacement.h`, `GetMeasurements` |
-| Kalman gain + innovation update | `EKF.Update` |
-| Angle-wrapping in innovation | `EKF.Update` (`wrap_angle`) |
-| Noise propagation through kinematic chain | `EKF_3DOFDifferentialDriveInputDisplacement.GetInput` (magic table) |
-| Uncertainty ellipse visualization | `GFLocalization.PlotUncertainty`, `GetEllipse` |
-| Feature observation model + Jacobians | `MapFeature.hfj`, `Jhfjx`, `g`, `Jgv` |
-| Pose-feature compounding (boxplus) | `Feature.boxplus`, `CartesianFeature.boxplus` |
-
----
-
-## Effect of Compass Reading Frequency
-
-The lab includes result plots at four compass reading frequencies:
-
-| Frequency | Behaviour |
-|---|---|
-| `1/500` Hz (very rare) | Essentially no compass updates; behaves close to dead reckoning, heading drifts |
-| `0.1` Hz | Occasional corrections; visible yaw drift between updates |
-| `1` Hz | Good heading tracking; position estimate tightens significantly |
-| `10` Hz | Near-continuous correction; 3σ bounds remain narrow throughout |
-
-These results illustrate how sensor update frequency directly controls uncertainty growth — a core insight of the EKF framework.
-
----
-
-## Running the Lab
-
-```bash
-pip install roboticstoolbox-python numpy matplotlib scipy
-cd PR_LAB3_EKF_CONSTANT_DISPLACEMENT
-
-# Compass-corrected EKF only (no map features):
-python EKF_3DOFDifferentialDriveInputDisplacement.py
-
-# EKF with Cartesian map-feature framework:
-python MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py
-```
+### Shared framework files
+`GaussianFilter.py`, `MapFeature.py`, `Feature.py`, `FEKFMBL.py`, `GetEllipse.py`, `blockarray.py`, `conversions.py`, `Pose.py` — identical in purpose to the displacement lab. See the lab3 (displacement) README for descriptions.
 
 ---
 
@@ -211,23 +203,36 @@ python MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM.py
 
 ```
 GaussianFilter
-├── KF
 └── EKF
-      └── (mixed into EKF_3DOFDifferentialDriveInputDisplacement)
+      └── (mixed into EKF_3DOFDifferentialDriveCtVelocity)
 
 Localization
 └── GFLocalization
-      ├── (mixed into EKF_3DOFDifferentialDriveInputDisplacement)
+      ├── (mixed into EKF_3DOFDifferentialDriveCtVelocity)
       └── FEKFMBL
-            └── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM)
+            └── (mixed into MBL_3DOFDDCtVelocityMM_2DCartesianFeatureOM)
 
-DR_3DOFDifferentialDrive     ← from PR_LAB1
-└── (mixed into EKF_3DOFDifferentialDriveInputDisplacement)
+DR_3DOFDifferentialDrive     ← from PR_LAB1 (encoder conversion reused in GetMeasurements)
+└── (mixed into EKF_3DOFDifferentialDriveCtVelocity)
 
 MapFeature
-├── Cartesian2DMapFeature
-│     └── (mixed into MBL_3DOFDDInputDisplacementMM_2DCartesianFeatureOM)
-└── (provides feature obs model to FEKFMBL)
+└── Cartesian2DMapFeature
+      └── (mixed into MBL_3DOFDDCtVelocityMM_2DCartesianFeatureOM)
+```
+
+---
+
+## Running the Lab
+
+```bash
+pip install roboticstoolbox-python numpy matplotlib scipy
+cd PR_LAB3_CONSTANT_VELOCITY
+
+# 6-state constant velocity EKF (compass + encoder fusion):
+python EKF_3DOFDifferentialDriveCtVelocity.py
+
+# With Cartesian map-feature framework:
+python MBL_3DOFDDCtVelocityMM_2DCartesianFeatureOM.py
 ```
 
 ---
@@ -241,6 +246,10 @@ MapFeature
 | `pulse_x_wheelTurns` | 1024 (sim) / 4096 (DR) | Encoder resolution |
 | `Re` | diag(22², 22²) | Encoder measurement noise covariance |
 | `v_yaw_std` | 5° | Compass heading noise std deviation |
+| `σ_u_dot` | 0.1 m/s² | Process noise: forward acceleration |
+| `σ_v_dot` | 0.01 m/s² | Process noise: lateral acceleration |
+| `σ_r_dot` | 1°/s² | Process noise: angular acceleration |
+| `x0` | `[0,0,0,0,0,0]^T` | Initial state (pose + zero velocity) |
+| `P0` | diag(0, 0, 0, 0.5², 0², 0.05²) | Initial covariance (velocity uncertain) |
 | `dt` | 0.1 s | Simulation time step |
 | `kSteps` | 5000 | Total simulation steps |
-| `alpha` | 0.95 | Chi-squared confidence level for data association |
